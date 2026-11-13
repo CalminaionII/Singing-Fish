@@ -160,14 +160,14 @@ public sealed class SingingFishModSystem : ModSystem
         sapi.World.BlockAccessor.GetBlockEntity(pos)?.GetBehavior<BEBehaviorSingingFish>()?.PlayNow();
     }
 
-    /// <summary>Volume and Motion activated: changing the fish, so build access on its land, like picking its song.</summary>
+    /// <summary>Volume, Motion activated and trigger range: changing the fish, so build access on its land, like picking its song.</summary>
     private void OnFishSettings(IServerPlayer player, FishSettingsPacket p)
     {
         if (p == null) return;
         var pos = new BlockPos(p.X, p.Y, p.Z);
         if (player.Entity?.Pos.SquareDistanceTo(pos.ToVec3d()) > 16 * 16) return;
         if (sapi.World.Claims.TestAccess(player, pos, EnumBlockAccessFlags.BuildOrBreak) != EnumWorldAccessResponse.Granted) return;
-        sapi.World.BlockAccessor.GetBlockEntity(pos)?.GetBehavior<BEBehaviorSingingFish>()?.SetSettings(p.Volume, p.Motion);
+        sapi.World.BlockAccessor.GetBlockEntity(pos)?.GetBehavior<BEBehaviorSingingFish>()?.SetSettings(p.Volume, p.Motion, p.Range);
     }
 
     // ------------------------------------------------------------------ client
@@ -242,7 +242,7 @@ public sealed class SingingFishModSystem : ModSystem
         var fish = be?.GetBehavior<BEBehaviorSingingFish>();
         if (fish == null || !fish.HasFish) return true;
         if (world.Side == EnumAppSide.Client && clientApi != null)
-            new GuiDialogSongPicker(clientApi, blockSel.Position, fish.SongKey, fish.SongName, fish.Volume, fish.Motion).TryOpen();
+            new GuiDialogSongPicker(clientApi, blockSel.Position, fish.SongKey, fish.SongName, fish.Volume, fish.Motion, fish.Range).TryOpen();
         __result = true;
         return false;
     }

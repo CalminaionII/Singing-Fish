@@ -39,7 +39,8 @@ mysongs.zip
 
 A fish sings nothing until someone picks its song: sneak + right-click the mounted fish with an empty hand to open
 the song menu. Choices: No song (the default), Random (a different song-pack song each time), any song-pack song, or
-one of your own songs.
+one of your own songs. The menu also sets the fish's Volume, its Range (how close, 1 - 16 blocks, someone must walk
+for it to start singing; 4 by default) and whether it sings when someone walks up.
 
 ## Your own songs (no pack needed)
 
