@@ -13,12 +13,13 @@ namespace SingingFish;
 /// WHAT it sings is chosen per fish in the song menu (sneak + right-click with an empty hand): nothing (the default - a
 /// fish sings only once someone has picked a song), a random song from the installed song packs, one pack song, or a
 /// player's own song (from their songs folder, uploaded to the server once and downloaded by whoever is near). The menu
-/// also sets the fish's volume and whether it is motion activated, and has Play and Stop singing.
+/// also sets the fish's volume, trigger range and whether it is motion activated, and has Play and Stop singing.
 ///
-/// SERVER decides when: every half second, if motion activated, it looks for players within <see cref="TriggerRange"/>
-/// blocks; when one arrives who was not there on the last look, and the fish is not still busy with the last song, it
-/// bumps a counter (with a random seed) and syncs it. Play does the same at once. Standing still in front of it does not
-/// repeat the song - walk away and back.
+/// SERVER decides when: every half second, if motion activated, it looks for players within the fish's trigger range
+/// (set in the menu, <see cref="MinRange"/> - <see cref="MaxRange"/> blocks, <see cref="DefaultRange"/> by default);
+/// when one arrives who was not there on the last look, and the fish is not still busy with the last song, it bumps a
+/// counter (with a random seed) and syncs it. Play does the same at once. Standing still in front of it does not repeat
+/// the song - walk away and back.
 ///
 /// CLIENTS act on a new counter: the song is decoded in the background (SongLibrary - sound and mouth timing), played
 /// straight through OpenAL (SongPlayer), and the still fish (drawn by the antler mount into the chunk) is swapped for a
@@ -28,7 +29,9 @@ namespace SingingFish;
 /// </summary>
 public sealed class BEBehaviorSingingFish : BlockEntityBehavior
 {
-    private const float TriggerRange = 4f;
+    /// <summary>Trigger range limits and default, in blocks. Kept at 16 or less: the song fades out by 32 blocks, so a
+    /// fish set off from further away would hardly be heard (16 is also how far away the menu's Play works).</summary>
+    public const int MinRange = 1, MaxRange = 16, DefaultRange = 4;
     /// <summary>How long the server waits before the fish may start again (the server does not know the song's length).</summary>
     private const int BusyMs = 20000;
     private const int MaxSongMs = 7 * 60 * 1000;
@@ -43,11 +46,13 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     private string songName = "";
     private float volume = 1f;
     private bool motion = true;
+    private float range = DefaultRange;
 
     public string SongKey => songKey;
     public string SongName => songName;
     public float Volume => volume;
     public bool Motion => motion;
+    public float Range => range;
 
     // server
     private long busyUntil;
@@ -104,7 +109,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         var centre = Pos.ToVec3d().Add(0.5, 0.5, 0.5);
         var now = new HashSet<string>();
         bool arrived = false;
-        foreach (var p in Api.World.GetPlayersAround(centre, TriggerRange, TriggerRange))
+        foreach (var p in Api.World.GetPlayersAround(centre, range, range))
         {
             if (p?.Entity == null || !p.Entity.Alive || p.WorldData?.CurrentGameMode == EnumGameMode.Spectator) continue;
             now.Add(p.PlayerUID);
@@ -148,11 +153,12 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         Blockentity.MarkDirty(false);
     }
 
-    /// <summary>SERVER: the menu's volume and Motion activated.</summary>
-    public void SetSettings(float newVolume, bool newMotion)
+    /// <summary>SERVER: the menu's volume, Motion activated and trigger range (0 or less: range left as it is).</summary>
+    public void SetSettings(float newVolume, bool newMotion, float newRange)
     {
         volume = float.IsFinite(newVolume) ? Math.Clamp(newVolume, 0f, 1f) : 1f;
         motion = newMotion;
+        if (float.IsFinite(newRange) && newRange > 0) range = Math.Clamp(newRange, MinRange, MaxRange);
         Blockentity.MarkDirty(false);
     }
 
@@ -168,6 +174,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         tree.SetString("singingFishSongName", songName);
         tree.SetFloat("singingFishVolume", volume);
         tree.SetBool("singingFishMotion", motion);
+        tree.SetFloat("singingFishRange", range);
     }
 
     public override void FromTreeAttributes(ITreeAttribute tree, IWorldAccessor worldAccessForResolve)
@@ -180,6 +187,8 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         songName = tree.GetString("singingFishSongName", "");
         volume = Math.Clamp(tree.GetFloat("singingFishVolume", 1f), 0f, 1f);
         motion = tree.GetBool("singingFishMotion", true);
+        float r = tree.GetFloat("singingFishRange", DefaultRange);
+        range = float.IsFinite(r) ? Math.Clamp(r, MinRange, MaxRange) : DefaultRange;
         if (Api is not ICoreClientAPI capi) return;
         Prefetch();
         if (seenStop != int.MinValue && stopSeq != seenStop)

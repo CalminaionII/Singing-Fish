@@ -36,7 +36,8 @@ public class PlaySongPacket
     [ProtoMember(3)] public int Z { get; set; }
 }
 
-/// <summary>CLIENT -> SERVER: this fish's volume (0..1) and whether it sings when someone walks up.</summary>
+/// <summary>CLIENT -> SERVER: this fish's volume (0..1), whether it sings when someone walks up, and how close they
+/// must come (blocks).</summary>
 [ProtoContract]
 public class FishSettingsPacket
 {
@@ -45,6 +46,8 @@ public class FishSettingsPacket
     [ProtoMember(3)] public int Z { get; set; }
     [ProtoMember(4)] public float Volume { get; set; }
     [ProtoMember(5)] public bool Motion { get; set; }
+    /// <summary>Trigger range in blocks; 0 (an older client) leaves the fish's range as it is.</summary>
+    [ProtoMember(6)] public float Range { get; set; }
 }
 
 /// <summary>SERVER -> CLIENT: "send me this song of yours" - the server does not hold it yet.</summary>

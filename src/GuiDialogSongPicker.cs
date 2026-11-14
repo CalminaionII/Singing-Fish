@@ -17,6 +17,7 @@ public sealed class GuiDialogSongPicker : GuiDialog
     private readonly string currentKey, currentName;
     private float volume;
     private bool motion;
+    private float range;
     /// <summary>Which folder of the songs folder the list shows, "" for everything. Only offered once the player has
     /// made folders in there; picking one narrows the list to that folder's songs.</summary>
     private string activeFolder = "";
@@ -28,10 +29,11 @@ public sealed class GuiDialogSongPicker : GuiDialog
     public override string ToggleKeyCombinationCode => null;
     public override bool PrefersUngrabbedMouse => true;
 
-    public GuiDialogSongPicker(ICoreClientAPI capi, BlockPos pos, string currentKey, string currentName, float volume, bool motion) : base(capi)
+    public GuiDialogSongPicker(ICoreClientAPI capi, BlockPos pos, string currentKey, string currentName, float volume, bool motion, float range) : base(capi)
     {
         this.volume = volume;
         this.motion = motion;
+        this.range = range;
         this.pos = pos.Copy();
         this.currentKey = currentKey ?? "";
         this.currentName = currentName ?? "";
@@ -108,7 +110,7 @@ public sealed class GuiDialogSongPicker : GuiDialog
         bg.BothSizing = ElementSizing.FitToChildren;
         ElementBounds dialog = ElementStdBounds.AutosizedMainDialog.WithAlignment(EnumDialogArea.CenterMiddle);
 
-        // Two parts: this fish (song, volume, walk-up switch, Play / Stop), then your own songs (folder). The help
+        // Two parts: this fish (song, volume, trigger range, walk-up switch, Play / Stop), then your own songs (folder). The help
         // text is measured, so a longer translation pushes the buttons down instead of running under them.
         const int W = 380, L = 70;
         int y = 32;
@@ -133,6 +135,9 @@ public sealed class GuiDialogSongPicker : GuiDialog
         c.AddStaticText(Lang.Get("singingfish:menu-volume"), label, ElementBounds.Fixed(0, y + 2, L, 22));
         c.AddSlider(OnVolume, ElementBounds.Fixed(L, y + 2, W - L, 20), "volume");
         y += 34;
+        c.AddStaticText(Text("singingfish:menu-range", "Range"), label, ElementBounds.Fixed(0, y + 2, L, 22));
+        c.AddSlider(OnRange, ElementBounds.Fixed(L, y + 2, W - L, 20), "range");
+        y += 34;
         c.AddStaticText(Lang.Get("singingfish:menu-motion"), label, ElementBounds.Fixed(0, y + 5, W - 40, 22));
         c.AddSwitch(OnMotion, ElementBounds.Fixed(W - 30, y, 30, 30), "motion");
         y += 40;
@@ -152,8 +157,14 @@ public sealed class GuiDialogSongPicker : GuiDialog
         c.AddSmallButton(Lang.Get("singingfish:menu-close"), () => TryClose(), ElementBounds.Fixed(W - 80, y, 80, 28));
         SingleComposer = c.EndChildElements().Compose();
         SingleComposer.GetSlider("volume")?.SetValues((int)Math.Round(volume * 100), 0, 100, 5, "%");
+        SingleComposer.GetSlider("range")?.SetValues(
+            Math.Clamp((int)Math.Round(range), BEBehaviorSingingFish.MinRange, BEBehaviorSingingFish.MaxRange),
+            BEBehaviorSingingFish.MinRange, BEBehaviorSingingFish.MaxRange, 1, Text("singingfish:menu-range-unit", " blocks"));
         SingleComposer.GetSwitch("motion")?.SetValue(motion);
     }
+
+    /// <summary>A translation, or the English given here if the mod's lang file does not have the key yet.</summary>
+    private static string Text(string key, string english) => Lang.GetIfExists(key) ?? english;
 
     private void OnFolder(string folder, bool selected)
     {
@@ -177,6 +188,13 @@ public sealed class GuiDialogSongPicker : GuiDialog
         return true;
     }
 
+    private bool OnRange(int value)
+    {
+        range = value;
+        SendSettings();
+        return true;
+    }
+
     private void OnMotion(bool on)
     {
         motion = on;
@@ -184,7 +202,7 @@ public sealed class GuiDialogSongPicker : GuiDialog
     }
 
     private void SendSettings() =>
-        capi.Network.GetChannel(SingingFishModSystem.Channel)?.SendPacket(new FishSettingsPacket { X = pos.X, Y = pos.Y, Z = pos.Z, Volume = volume, Motion = motion });
+        capi.Network.GetChannel(SingingFishModSystem.Channel)?.SendPacket(new FishSettingsPacket { X = pos.X, Y = pos.Y, Z = pos.Z, Volume = volume, Motion = motion, Range = range });
 
     private bool OnPlay()
     {
