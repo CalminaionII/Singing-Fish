@@ -273,43 +273,196 @@ public sealed class ClientSongStore
 }
 
 /// <summary>
-/// SERVER: players' songs, kept as ModData/singingfish/playersongs/&lt;player&gt;/&lt;name&gt;_&lt;id&gt;.ogg - an admin
-/// can open the folder and see what is there, and delete anything (a fish whose song is gone sings a random one).
+/// SERVER: every song the server holds, for everyone. Two kinds:
+/// <list type="bullet">
+/// <item>Players' uploads, kept as ModData/singingfish/playersongs/&lt;player&gt;/&lt;name&gt;_&lt;id&gt;.ogg.</item>
+/// <item>Server songs: whatever an admin drops into ModData/singingfish/serversongs (.ogg, .mp3, .wav, folders too) -
+/// no mod needed. MP3/WAV are converted once, in the background, into ModData/singingfish/serverconverted.</item>
+/// </list>
+/// Both are sent to players by id when a fish near them sings one, and listed in everyone's song menu (the catalog).
+/// Folders are read off the main thread at start and whenever someone presses Refresh in the song menu; an admin may
+/// delete files by hand too (Refresh picks that up), or remove a song from the menu.
 /// </summary>
 public sealed class ServerSongStore
 {
+    /// <summary>One song on the server. <see cref="Owner"/> is the uploader's folder name, "" for a server song;
+    /// <see cref="Source"/> is the file an admin put in the server songs folder (the MP3 for a converted one).</summary>
+    public sealed record Entry(string Id, string Name, string Owner, string File, string Source)
+    {
+        public bool ServerSong => Owner.Length == 0;
+    }
+
+    private sealed record Known(long Length, DateTime Written, string Id, string OggFile);
+
     private readonly ICoreServerAPI sapi;
-    private readonly Dictionary<string, string> fileById = new();
+    private readonly object gate = new();
+    private Dictionary<string, Entry> byId = new();
+    private readonly Dictionary<string, Known> known = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, bool> converting = new();
     private readonly Dictionary<string, (string Id, string Name, byte[][] Parts)> incoming = new();
+    private bool scanning, scanAgain;
+    private long lastRescanMs = -100000;
+
+    /// <summary>The list of songs changed (set from any thread; the mod system sends the new catalog on its tick).</summary>
+    public volatile bool Dirty;
 
     public ServerSongStore(ICoreServerAPI sapi)
     {
         this.sapi = sapi;
+        try { Directory.CreateDirectory(PlayerRoot); Directory.CreateDirectory(ServerRoot); }
+        catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not make the song folders: {0}", e.Message); }
         Rescan();
     }
 
-    private static string Root => Path.Combine(GamePaths.DataPath, "ModData", "singingfish", "playersongs");
+    private static string PlayerRoot => Path.Combine(GamePaths.DataPath, "ModData", "singingfish", "playersongs");
+    public static string ServerRoot => Path.Combine(GamePaths.DataPath, "ModData", "singingfish", "serversongs");
+    private static string ConvertedRoot => Path.Combine(GamePaths.DataPath, "ModData", "singingfish", "serverconverted");
 
-    private void Rescan()
+    /// <summary>Every song now: server songs first, then by owner and name.</summary>
+    public List<Entry> All()
     {
-        fileById.Clear();
+        lock (gate) return byId.Values.OrderBy(e => e.Owner, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(e => e.Name, StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    public Entry Get(string id)
+    {
+        if (!Songs.IsWellFormedId(id)) return null;
+        lock (gate) return byId.TryGetValue(id, out var e) && File.Exists(e.File) ? e : null;
+    }
+
+    public bool Has(string id) => Get(id) != null;
+
+    /// <summary>The menu's Refresh: read both folders again, at most every few seconds whoever asks.</summary>
+    public void RescanSoon()
+    {
+        long now = sapi.World.ElapsedMilliseconds;
+        if (now - lastRescanMs < 5000) return;
+        lastRescanMs = now;
+        Rescan();
+    }
+
+    /// <summary>Reads both folders again in the background; <see cref="Dirty"/> is set when done.</summary>
+    public void Rescan()
+    {
+        lock (gate)
+        {
+            if (scanning) { scanAgain = true; return; }
+            scanning = true;
+        }
+        Task.Run(() =>
+        {
+            while (true)
+            {
+                var found = Scan();
+                lock (gate)
+                {
+                    byId = found;
+                    if (!scanAgain) { scanning = false; break; }
+                    scanAgain = false;
+                }
+            }
+            Dirty = true;
+        });
+    }
+
+    private Dictionary<string, Entry> Scan()
+    {
+        var found = new Dictionary<string, Entry>();
         try
         {
-            Directory.CreateDirectory(Root);
-            foreach (var file in Directory.GetFiles(Root, "*.ogg", SearchOption.AllDirectories))
+            Directory.CreateDirectory(PlayerRoot);
+            foreach (var dir in Directory.GetDirectories(PlayerRoot))
             {
-                string stem = Path.GetFileNameWithoutExtension(file);
-                string id = stem.Length >= 16 ? stem[^16..] : "";
-                if (Songs.IsWellFormedId(id)) fileById[id] = file;
+                string owner = Path.GetFileName(dir);
+                foreach (var file in Directory.GetFiles(dir, "*.ogg", SearchOption.AllDirectories))
+                {
+                    string stem = Path.GetFileNameWithoutExtension(file);
+                    string id = stem.Length >= 16 ? stem[^16..] : "";
+                    if (!Songs.IsWellFormedId(id)) continue;
+                    string name = stem.Length > 17 ? stem[..^17].Replace('_', ' ') : "";
+                    found[id] = new Entry(id, Songs.CleanName(name), owner, file, null);
+                }
             }
         }
         catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not read the player songs folder: {0}", e.Message); }
+
+        try
+        {
+            Directory.CreateDirectory(ServerRoot);
+            var files = Directory.GetFiles(ServerRoot, "*", SearchOption.AllDirectories)
+                .Where(f => f.EndsWith(".ogg", StringComparison.OrdinalIgnoreCase) || SongConverter.CanConvert(f));
+            foreach (var file in files)
+            {
+                try
+                {
+                    var info = new FileInfo(file);
+                    if (info.Length > 60 * 1024 * 1024) continue;
+                    Known k;
+                    lock (gate) known.TryGetValue(file, out k);
+                    if (k == null || k.Length != info.Length || k.Written != info.LastWriteTimeUtc || (k.OggFile != null && !File.Exists(k.OggFile)))
+                    {
+                        k = Examine(file, info);
+                        lock (gate) { if (k != null) known[file] = k; else known.Remove(file); }
+                    }
+                    if (k?.Id == null) continue;   // not a song, or still converting
+                    string rel = Path.GetRelativePath(ServerRoot, file).Replace(Path.DirectorySeparatorChar, '/');
+                    int slash = rel.LastIndexOf('/');
+                    string name = Songs.CleanName(rel);
+                    if (slash > 0) name = rel[..slash] + "/" + name;
+                    // the same song uploaded by a player and in the server folder: listed once, as the server's
+                    found[k.Id] = new Entry(k.Id, name, "", k.OggFile, file);
+                }
+                catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not read {0}: {1}", Path.GetFileName(file), e.Message); }
+            }
+        }
+        catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not read the server songs folder: {0}", e.Message); }
+        return found;
     }
 
-    public bool Has(string id) => Songs.IsWellFormedId(id) && fileById.TryGetValue(id, out var f) && File.Exists(f);
+    /// <summary>One server song file: an .ogg is hashed as it is; an MP3/WAV is looked up in the converted folder or converted.</summary>
+    private Known Examine(string file, FileInfo info)
+    {
+        var bytes = File.ReadAllBytes(file);
+        if (SongConverter.CanConvert(file))
+        {
+            string oggFile = Path.Combine(ConvertedRoot, Songs.IdOf(bytes) + ".ogg");
+            if (!File.Exists(oggFile))
+            {
+                StartConverting(file, oggFile);
+                return new Known(info.Length, info.LastWriteTimeUtc, null, null);
+            }
+            var ogg = File.ReadAllBytes(oggFile);
+            return Songs.LooksLikeOgg(ogg) ? new Known(info.Length, info.LastWriteTimeUtc, Songs.IdOf(ogg), oggFile) : null;
+        }
+        return Songs.LooksLikeOgg(bytes) ? new Known(info.Length, info.LastWriteTimeUtc, Songs.IdOf(bytes), file) : null;
+    }
 
-    private static string FolderFor(IServerPlayer player) =>
-        Path.Combine(Root, Songs.CleanName(player.PlayerName).Replace(' ', '_'));
+    private void StartConverting(string source, string target)
+    {
+        if (!converting.TryAdd(target, true)) return;
+        Task.Run(() =>
+        {
+            try
+            {
+                var ogg = SongConverter.ToMonoOgg(source);
+                Directory.CreateDirectory(ConvertedRoot);
+                string temp = target + ".part";
+                File.WriteAllBytes(temp, ogg);
+                File.Move(temp, target, true);
+                lock (gate) known.Remove(source);
+                sapi.Logger.Notification("[Singing Fish] Server song {0} is ready", Path.GetFileName(source));
+                Rescan();
+            }
+            catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not convert {0}: {1}", Path.GetFileName(source), e.Message); }
+            finally { converting.TryRemove(target, out _); }
+        });
+    }
+
+    /// <summary>The folder a player's uploads go in - also how the song menu names the uploader.</summary>
+    public static string FolderNameOf(string playerName) => Songs.CleanName(playerName).Replace(' ', '_');
+
+    private static string FolderFor(IServerPlayer player) => Path.Combine(PlayerRoot, FolderNameOf(player.PlayerName));
 
     private int CountFor(IServerPlayer player)
     {
@@ -317,7 +470,7 @@ public sealed class ServerSongStore
         catch (Exception) { return 0; }
     }
 
-    /// <summary>One piece of a song from a player; the last checks and keeps it.</summary>
+    /// <summary>One piece of a song from a player; the last checks and keeps it. The caller has checked they may add songs.</summary>
     public void OnUploadChunk(IServerPlayer player, SongChunkPacket p, SingingFishConfig config, IServerNetworkChannel channel)
     {
         if (!Songs.IsWellFormedId(p?.Id) || p.Data == null || p.Data.Length > Songs.ChunkBytes) return;
@@ -328,7 +481,6 @@ public sealed class ServerSongStore
             incoming.Remove(key);
             channel.SendPacket(new SongRefusedPacket { Id = p.Id, LangKey = lang, Arg = arg }, player);
         }
-        if (!config.AllowPlayerSongs) { Refuse("singingfish:refused-off"); return; }
         if (p.Total <= 0 || p.Total > maxChunks) { Refuse("singingfish:refused-big", config.MaxSongMB.ToString()); return; }
         if (p.Index < 0 || p.Index >= p.Total) return;
         if (Has(p.Id)) { incoming.Remove(key); return; }
@@ -348,18 +500,44 @@ public sealed class ServerSongStore
             Directory.CreateDirectory(FolderFor(player));
             string file = Path.Combine(FolderFor(player), up.Name.Replace(' ', '_') + "_" + p.Id + ".ogg");
             File.WriteAllBytes(file, bytes);
-            fileById[p.Id] = file;
+            lock (gate) byId[p.Id] = new Entry(p.Id, up.Name, FolderNameOf(player.PlayerName), file, null);
+            Dirty = true;
             sapi.Logger.Audit("[Singing Fish] {0} added the song {1} ({2} KB)", player.PlayerName, up.Name, bytes.Length / 1024);
         }
         catch (Exception e) { sapi.Logger.Warning("[Singing Fish] Could not keep {0}'s song: {1}", player.PlayerName, e.Message); }
     }
 
+    /// <summary>
+    /// Deletes a song for good: an upload's file, or a server song's own file (and its converted copy). The caller has
+    /// checked who may. Fish set to it go quiet.
+    /// </summary>
+    public bool Remove(string id, IServerPlayer by)
+    {
+        var e = Get(id);
+        if (e == null) return false;
+        try
+        {
+            if (e.Source != null && File.Exists(e.Source)) File.Delete(e.Source);
+            if (e.File != e.Source && File.Exists(e.File)) File.Delete(e.File);
+        }
+        catch (Exception ex)
+        {
+            sapi.Logger.Warning("[Singing Fish] Could not remove the song {0}: {1}", e.Name, ex.Message);
+            return false;
+        }
+        lock (gate) { byId.Remove(id); if (e.Source != null) known.Remove(e.Source); }
+        Dirty = true;
+        sapi.Logger.Audit("[Singing Fish] {0} removed the song {1} ({2})", by.PlayerName, e.Name, e.ServerSong ? "server song" : "added by " + e.Owner);
+        return true;
+    }
+
     /// <summary>A player wants a song a fish near them sings: send it in pieces, or "do not have it".</summary>
     public void OnRequest(IServerPlayer player, SongRequestPacket p, IServerNetworkChannel channel)
     {
-        if (!Has(p?.Id)) { channel.SendPacket(new SongChunkPacket { Id = p?.Id, Total = 0 }, player); return; }
-        byte[] bytes;
-        try { bytes = File.ReadAllBytes(fileById[p.Id]); } catch (Exception) { channel.SendPacket(new SongChunkPacket { Id = p.Id, Total = 0 }, player); return; }
+        var e = Get(p?.Id);
+        byte[] bytes = null;
+        try { if (e != null) bytes = File.ReadAllBytes(e.File); } catch (Exception) { }
+        if (bytes == null) { channel.SendPacket(new SongChunkPacket { Id = p?.Id, Total = 0 }, player); return; }
         int total = Math.Max(1, (bytes.Length + Songs.ChunkBytes - 1) / Songs.ChunkBytes);
         for (int i = 0; i < total; i++)
         {

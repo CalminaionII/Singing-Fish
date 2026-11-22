@@ -10,15 +10,17 @@ namespace SingingFish;
 /// On a vanilla antler mount: when it holds a mounted fish, the fish sings - when a player walks up (Motion activated,
 /// the default) or when someone presses Play in its song menu.
 ///
-/// WHAT it sings is chosen per fish in the song menu (sneak + right-click with an empty hand): nothing (the default - a
-/// fish sings only once someone has picked a song), a random song from the installed song packs, one pack song, or a
-/// player's own song (from their songs folder, uploaded to the server once and downloaded by whoever is near). The menu
+/// WHAT it sings is chosen per fish in the song menu (sprint + right-click with an empty hand): nothing (the default - a
+/// fish sings only once someone has picked a song), Random, Random (my songs), one of the two songs that come with
+/// the mod, one of the server's own songs, or a player's own song (from their songs folder, uploaded to the server once and downloaded by whoever is near). The menu
 /// also sets the fish's volume, trigger range and whether it is motion activated, and has Play and Stop singing.
 ///
 /// SERVER decides when: every half second, if motion activated, it looks for players within the fish's trigger range
 /// (set in the menu, <see cref="MinRange"/> - <see cref="MaxRange"/> blocks, <see cref="DefaultRange"/> by default);
 /// when one arrives who was not there on the last look, and the fish is not still busy with the last song, it bumps a
-/// counter (with a random seed) and syncs it. Play does the same at once. Standing still in front of it does not repeat
+/// counter and syncs it. Play does the same at once. For Random the SERVER also picks the song each time (from the
+/// mod's songs, the server's songs and, when the server takes them, every player's song on it) and syncs it, so everyone hears the same one
+/// and players' songs are in the draw. Standing still in front of it does not repeat
 /// the song - walk away and back.
 ///
 /// CLIENTS act on a new counter: the song is decoded in the background (SongLibrary - sound and mouth timing), played
@@ -38,11 +40,21 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     private const float HeadOut = 30, JawOpen = 25, TailOut = 35;
 
     // synced
-    private int seq, seed;
+    private int seq;
+    /// <summary>For Random: the song the server picked for the latest sing, as a "pack:" / "user:" key ("pack:" = one
+    /// of the songs that come with the mod - the name is kept from when other mods could add songs, so fish keep them).</summary>
+    private string playKey = "";
     /// <summary>Bumped by Stop singing: every client stops this fish's song when it changes.</summary>
     private int stopSeq;
-    /// <summary>"" no song (default), "random", "pack:&lt;asset location&gt;", "user:&lt;id&gt;".</summary>
+    /// <summary>"" no song (default), "random", "randomby:&lt;player folder&gt;" (Random from one player's songs),
+    /// "pack:&lt;asset location&gt;", "user:&lt;id&gt;".</summary>
     private string songKey = "";
+
+    /// <summary>The key for Random from one player's own songs on the server: this prefix + their folder name.</summary>
+    public const string RandomByPrefix = "randomby:";
+
+    /// <summary>Either Random: the server picks the song each time.</summary>
+    public static bool IsRandomKey(string key) => key == "random" || key.StartsWith(RandomByPrefix);
     private string songName = "";
     private float volume = 1f;
     private bool motion = true;
@@ -121,11 +133,59 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
 
     private void Sing()
     {
+        if (IsRandomKey(songKey))
+        {
+            var pool = RandomPool();
+            if (pool.Count == 0) return;
+            // not the same song twice running when there is a choice
+            if (pool.Count > 1) pool.Remove(playKey);
+            playKey = pool[Api.World.Rand.Next(pool.Count)];
+        }
+        else if (!SongAllowed(songKey) || PlayerSongSilenced(songKey)) return;
         seq++;
-        seed = Api.World.Rand.Next();
         busyUntil = Api.World.ElapsedMilliseconds + BusyMs;
         Blockentity.MarkDirty(false);
     }
+
+    /// <summary>SERVER: what Random may pick - the mod's own songs (while the server includes them), every server song, and every player's song on
+    /// the server while players' songs are on and Random may play them. Random (my songs) picks only from the songs
+    /// that one player added to the server (none while the server takes no players' songs; RandomPlaysPlayerSongs is
+    /// about plain Random and does not apply - the player chose their own songs).</summary>
+    private List<string> RandomPool()
+    {
+        var config = SingingFishModSystem.ServerConfig;
+        if (songKey.StartsWith(RandomByPrefix))
+        {
+            string owner = songKey[RandomByPrefix.Length..];
+            if (SingingFishModSystem.ServerStore is not { } held || config is not { PlayerSongsOn: true }) return [];
+            return held.All().Where(e => !e.ServerSong && e.Owner == owner).Select(e => "user:" + e.Id).ToList();
+        }
+        var pool = ModSongs(Api).Where(ModSongAllowed).Select(l => "pack:" + l).ToList();
+        if (SingingFishModSystem.ServerStore is { } store)
+        {
+            bool players = config is { PlayerSongsOn: true, RandomPlaysPlayerSongs: true };
+            pool.AddRange(store.All().Where(e => e.ServerSong || players).Select(e => "user:" + e.Id));
+        }
+        return pool;
+    }
+
+    /// <summary>The songs that come with the mod are its own domain's; a server can leave them out.</summary>
+    public static bool IsBuiltIn(AssetLocation loc) => loc?.Domain == "singingfish";
+
+    /// <summary>Whether this "pack:" song may be sung here: only the mod's own songs (song packs from other mods are no
+    /// longer read - the server songs folder does that job), and only while the server includes them.</summary>
+    public static bool ModSongAllowed(AssetLocation loc) => IsBuiltIn(loc) && SingingFishModSystem.BuiltInSongs;
+
+    /// <summary>A fish's picked song may still be sung (a built-in one the server has since left out may not).</summary>
+    public static bool SongAllowed(string key) =>
+        !key.StartsWith("pack:") || ModSongAllowed(new AssetLocation(key[5..]));
+
+    /// <summary>SERVER: a fish set to a song a player added stays quiet while the server takes no players' songs
+    /// (PlayerSongs Nobody hides them from the menu and Random; this stops fish already set to one). Server songs are
+    /// not affected.</summary>
+    private static bool PlayerSongSilenced(string key) =>
+        key.StartsWith("user:") && SingingFishModSystem.ServerConfig is { PlayerSongsOn: false }
+        && SingingFishModSystem.ServerStore?.Get(key[5..]) is { ServerSong: false };
 
     /// <summary>SERVER: the menu's Play - sings now, motion or not (needs a song picked).</summary>
     public void PlayNow()
@@ -168,7 +228,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     {
         base.ToTreeAttributes(tree);
         tree.SetInt("singingFishSeq", seq);
-        tree.SetInt("singingFishSeed", seed);
+        tree.SetString("singingFishPlayKey", playKey);
         tree.SetInt("singingFishStop", stopSeq);
         tree.SetString("singingFishSong", songKey);
         tree.SetString("singingFishSongName", songName);
@@ -181,7 +241,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     {
         base.FromTreeAttributes(tree, worldAccessForResolve);
         seq = tree.GetInt("singingFishSeq");
-        seed = tree.GetInt("singingFishSeed");
+        playKey = tree.GetString("singingFishPlayKey", "");
         stopSeq = tree.GetInt("singingFishStop");
         songKey = tree.GetString("singingFishSong", "");
         songName = tree.GetString("singingFishSongName", "");
@@ -206,43 +266,36 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
 
     // ------------------------------------------------------------------ client: which song
 
-    private static List<AssetLocation> packSongs;
+    private static List<AssetLocation> modSongs;
 
-    internal static void ResetSongs() => packSongs = null;
+    internal static void ResetSongs() => modSongs = null;
 
-    /// <summary>Every song pack's songs (sounds/singingfish/*.ogg of any domain), the same order on every client.</summary>
-    public static IReadOnlyList<AssetLocation> PackSongs(ICoreClientAPI capi)
+    /// <summary>The songs that come with the mod (its own sounds/singingfish/*.ogg - other mods' are not read), the same
+    /// order everywhere. Sounds are a universal asset category, so the server has them too (Random is picked there).</summary>
+    public static IReadOnlyList<AssetLocation> ModSongs(ICoreAPI api)
     {
-        if (packSongs != null) return packSongs;
-        return packSongs = capi.Assets.GetMany("sounds/singingfish/", null, false)
+        if (modSongs != null) return modSongs;
+        return modSongs = api.Assets.GetMany("sounds/singingfish/", "singingfish", false)
             .Select(a => a.Location).Where(l => l.Path.EndsWith(".ogg", StringComparison.OrdinalIgnoreCase))
             .OrderBy(l => l.ToString(), StringComparer.Ordinal).ToList();
     }
 
     /// <summary>
     /// This fish's song as a key for the song library and where its bytes are - (null, null) when nothing is picked, a
-    /// pack song is not installed here, or a player song is not on this computer yet (then it is asked for).
+    /// "pack:" song is not one of the mod's own, or a player song is not on this computer yet (then it is asked for).
     /// </summary>
     private (string key, Func<byte[]> bytes) SongSource(ICoreClientAPI capi)
     {
-        if (songKey == "random" || songKey.StartsWith("pack:"))
+        string key = CurrentKey;
+        if (key.StartsWith("pack:"))
         {
-            AssetLocation loc;
-            if (songKey == "random")
-            {
-                var list = PackSongs(capi);
-                loc = list.Count == 0 ? null : list[(int)((uint)seed % (uint)list.Count)];
-            }
-            else
-            {
-                loc = new AssetLocation(songKey[5..]);
-                if (!PackSongs(capi).Contains(loc)) loc = null;
-            }
-            return loc == null ? (null, null) : ("pack:" + loc, () => capi.Assets.TryGet(loc)?.Data);
+            var loc = new AssetLocation(key[5..]);
+            if (!ModSongs(capi).Contains(loc)) return (null, null);
+            return ("pack:" + loc, () => capi.Assets.TryGet(loc)?.Data);
         }
-        if (songKey.StartsWith("user:") && SingingFishModSystem.ClientStore is { } store)
+        if (key.StartsWith("user:") && SingingFishModSystem.ClientStore is { } store)
         {
-            string id = songKey[5..];
+            string id = key[5..];
             if (!store.Has(id)) { store.Request(id); return (null, null); }
             return ("user:" + id, () => store.Bytes(id));
         }
@@ -255,10 +308,13 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     /// </summary>
     private void Prefetch()
     {
-        if (Api is not ICoreClientAPI capi || songKey == "random") return;
+        if (Api is not ICoreClientAPI capi || IsRandomKey(songKey)) return;
         var (key, bytes) = SongSource(capi);
         if (key != null) SongLibrary.Get(capi, key, bytes);
     }
+
+    /// <summary>The song this fish sings now: its pick, or for Random the server's latest pick.</summary>
+    private string CurrentKey => IsRandomKey(songKey) ? playKey : songKey;
 
     private void OnSongArrived(string id)
     {
@@ -286,7 +342,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         var (key, bytes) = SongSource(capi);
         if (key == null)
         {
-            if (songKey.StartsWith("user:")) { pendingId = songKey[5..]; pendingSince = capi.World.ElapsedMilliseconds; }
+            if (CurrentKey.StartsWith("user:")) { pendingId = CurrentKey[5..]; pendingSince = capi.World.ElapsedMilliseconds; }
             return;
         }
         var song = SongLibrary.Get(capi, key, bytes);
@@ -297,7 +353,8 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
         {
             if (!EnsureRig(capi, fish)) return;
             long rigMs = watch.ElapsedMilliseconds;
-            rig.CustomTransform = MountMatrix(fish);
+            var shift = RecessShift(capi);
+            rig.CustomTransform = MountMatrix(fish, shift);
             playing = song;
             headOutTimes = HeadSchedule(key, song.Seconds);
             randomFlicks = FlickSchedule(key, song.Seconds);
@@ -308,7 +365,9 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
             singing = true;
             stopping = false;
             rig.Visible = true;
-            player = SongPlayer.Play(capi, song, Pos.ToVec3d().Add(0.5, 0.5, 0.5), volume);
+            var at = Pos.ToVec3d().Add(0.5, 0.5, 0.5);
+            if (shift != null) at.Add(shift.X, shift.Y, shift.Z);
+            player = SongPlayer.Play(capi, song, at, volume);
             capi.World.BlockAccessor.MarkBlockDirty(Pos);
             if (watch.ElapsedMilliseconds > 40)
                 capi.Logger.Notification("[Singing Fish] Starting {0} took {1} ms on the main thread (the fish's model {2} ms)", key, watch.ElapsedMilliseconds, rigMs);
@@ -447,6 +506,7 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
 
         headSide = OutSide(fish);
         var (jaw, axis, sign) = FindJaw(shape, names);
+        if (JawOpensOtherWay.Contains(path.Path.Split('/').Last().Replace(".json", ""))) sign = -sign;
         jawSign = sign;
         // the tail end only: "Rear" (the last body piece and its fin) on vanilla fish; the middle section only if a fish has no Rear
         string tail = names.Contains("Rear") ? "Rear" : names.Contains("Midsection") ? "Midsection" : null;
@@ -493,6 +553,17 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     private static readonly string[] JawNames = ["Jaw", "JawLower", "Jaw2", "mouth", "Mouth"];
 
     /// <summary>
+    /// Fish models whose jaw opens UP with FindJaw's direction (mostly jaws hung under a top lip, hinged at their back),
+    /// so it is turned the other way. Shape file names, without ".json". Seen in game: barracudas, sheatfish, arapaima,
+    /// juvenile sturgeon, adult largemouth bass; the pike has the barracudas' build exactly (not seen).
+    /// </summary>
+    private static readonly HashSet<string> JawOpensOtherWay = new(StringComparer.Ordinal)
+    {
+        "barracuda-adult", "barracuda-juvenile", "pike-adult", "pike-juvenile", "sheatfish-adult", "sheatfish-juvenile",
+        "arapaima-adult", "arapaima-juvenile", "sturgeon-juvenile", "bass-adult",
+    };
+
+    /// <summary>
     /// The fish's jaw, the axis it opens about (0 X, 1 Y, 2 Z) and which way, from the fish's OWN "eat" animation: most
     /// vanilla fish call it Jaw and open it with negative Z, but the arapaima has Jaw2, the carp and sheatfish JawLower,
     /// the sturgeon mouth (opened with +Z). The eat keyframe that moves a jaw part furthest decides. No eat: the first
@@ -520,9 +591,10 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
     /// Where the antler mount draws its item: the item's onAntlerMountTransform (MeshData.ModelTransform's order), then
     /// the mount's turn about the block centre (BlockEntityAntlerMount.genTransformationMatrices).
     /// </summary>
-    private float[] MountMatrix(ItemStack fish)
+    private float[] MountMatrix(ItemStack fish, Vec3f shift)
     {
         var m = Mat4f.Create();
+        if (shift != null) Mat4f.Translate(m, shift.X, shift.Y, shift.Z);
         float angle = (Blockentity as BlockEntityAntlerMount)?.MeshAngleRad ?? 0;
         Mat4f.Translate(m, 0.5f, 0, 0.5f);
         Mat4f.RotateY(m, m, angle - GameMath.PIHALF);
@@ -538,6 +610,34 @@ public sealed class BEBehaviorSingingFish : BlockEntityBehavior
             Mat4f.Translate(m, -t.Origin.X, -t.Origin.Y, -t.Origin.Z);
         }
         return m;
+    }
+
+    /// <summary>
+    /// How far Chiseled Wall Mounting (modid chiseledwallmounting) has moved this mount into a chiseled recess, in blocks,
+    /// or null. That mod shifts the mount's chunk mesh when it is drawn, so the still fish sits in the recess, but our
+    /// singing fish is drawn by itself and would appear where a mount on a plain wall would be. Its client cache is public
+    /// (ChiseledWallMounting.ClientMountCache.TryGet(BlockPos, out RecessedMountRecord), record.Translation); it is read by
+    /// reflection so the mod is not needed, and anything unexpected just means no shift.
+    /// </summary>
+    private Vec3f RecessShift(ICoreClientAPI capi)
+    {
+        try
+        {
+            var mod = capi.ModLoader.GetMod("chiseledwallmounting");
+            var asm = mod?.Systems?.FirstOrDefault()?.GetType().Assembly;
+            var tryGet = asm?.GetType("ChiseledWallMounting.ClientMountCache")?.GetMethod("TryGet", [typeof(BlockPos), asm.GetType("ChiseledWallMounting.RecessedMountRecord")?.MakeByRefType()]);
+            if (tryGet == null) return null;
+            var args = new object[] { Pos, null };
+            if (tryGet.Invoke(null, args) is not true || args[1] == null) return null;
+            if (args[1].GetType().GetProperty("Translation")?.GetValue(args[1]) is not Vec3f t || (t.X == 0 && t.Y == 0 && t.Z == 0)) return null;
+            capi.Logger.Debug("[Singing Fish] Chiseled Wall Mounting moves the fish at {0} by {1}, {2}, {3}", Pos, t.X, t.Y, t.Z);
+            return t;
+        }
+        catch (Exception e)
+        {
+            capi.Logger.Warning("[Singing Fish] Could not read Chiseled Wall Mounting's offset at {0}: {1}", Pos, e.Message);
+            return null;
+        }
     }
 
     public override void OnBlockRemoved()

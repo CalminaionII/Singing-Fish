@@ -14,7 +14,7 @@ public sealed class SongData
 }
 
 /// <summary>
-/// CLIENT: songs decoded once, in the background - so nothing heavy happens on the game's main thread. An Ogg (song pack,
+/// CLIENT: songs decoded once, in the background - so nothing heavy happens on the game's main thread. An Ogg (the mod's own song,
 /// own folder, download) is read with NVorbis, mixed to mono and kept as 16-bit samples, and its mouth timing worked out
 /// from the same samples. A few songs are kept; the oldest unused goes first.
 /// </summary>
@@ -58,9 +58,25 @@ public static class SongLibrary
                 order.Remove(key); order.Add(key);
                 while (order.Count > Keep) { ready.Remove(order[0]); order.RemoveAt(0); }
             }
-            capi.Event.EnqueueMainThreadTask(() => Ready?.Invoke(key), "singingfish-song-ready");
+            capi.Event.EnqueueMainThreadTask(() =>
+            {
+                // what the tail found, so a song whose tail does not keep time can be looked into
+                capi.Logger.Notification("[Singing Fish] Tail for {0}: {1}", NameOf(key), song.Timing?.TailInfo ?? "song too short");
+                Ready?.Invoke(key);
+            }, "singingfish-song-ready");
         });
         return null;
+    }
+
+    /// <summary>A song's name for the log: its file for the mod's own, else the name the server or songs folder gives it.</summary>
+    private static string NameOf(string key)
+    {
+        if (key.StartsWith("pack:")) return Path.GetFileNameWithoutExtension(key[5..]);
+        if (!key.StartsWith("user:")) return key;
+        string id = key[5..];
+        return SingingFishModSystem.Catalog.FirstOrDefault(s => s.Id == id)?.Name
+            ?? SingingFishModSystem.ClientStore?.OwnSongs.FirstOrDefault(s => s.Id == id)?.Name
+            ?? key;
     }
 
     private static SongData Decode(byte[] ogg)
